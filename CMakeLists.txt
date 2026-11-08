@@ -13,14 +13,10 @@ if(NOT EXISTS ${NAM_DIR}/NAM)
   message(FATAL_ERROR "NeuralAmpModelerCore not found in deps/. See README step 1.")
 endif()
 
-# Same source list the official TONE3000 plugin compiles (plugin/CMakeLists.txt).
+# Every NAM Core source file (the file layout changes between revisions, so no fixed list).
 # Compiled straight into the executable so the static model-parser registrations
 # are not stripped by the linker.
-set(NAM_SRC
-  ${NAM_DIR}/NAM/activations.cpp ${NAM_DIR}/NAM/conv1d.cpp ${NAM_DIR}/NAM/container.cpp
-  ${NAM_DIR}/NAM/convnet.cpp ${NAM_DIR}/NAM/dsp.cpp ${NAM_DIR}/NAM/get_dsp.cpp
-  ${NAM_DIR}/NAM/lstm.cpp ${NAM_DIR}/NAM/ring_buffer.cpp ${NAM_DIR}/NAM/util.cpp
-  ${NAM_DIR}/NAM/wavenet/a2_fast.cpp ${NAM_DIR}/NAM/wavenet/model.cpp ${NAM_DIR}/NAM/wavenet/slimmable.cpp)
+file(GLOB_RECURSE NAM_SRC CONFIGURE_DEPENDS ${NAM_DIR}/NAM/*.cpp)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SDL2 REQUIRED sdl2)
