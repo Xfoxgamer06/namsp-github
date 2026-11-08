@@ -22,9 +22,15 @@ jobs:
         run: git clone --depth 1 --recurse-submodules https://github.com/sdatkinson/NeuralAmpModelerCore.git deps/NeuralAmpModelerCore
 
       - name: Build
+        shell: bash
         run: |
           cmake -S . -B build
-          cmake --build build -j4
+          if ! cmake --build build -j4 > build.log 2>&1; then
+            echo "=== LAST 40 LINES ==="; tail -40 build.log
+            echo "=== UNDEFINED REFERENCES ==="; grep -o "undefined reference to .*" build.log | sort -u | head -40
+            echo "=== FIRST ERRORS ==="; grep -m 15 -E "error:|Error " build.log
+            exit 1
+          fi
 
       - name: Package
         run: |
