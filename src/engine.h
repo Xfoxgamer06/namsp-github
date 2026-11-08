@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "drift.h"
 #include "dsp.h"
 #include "nam_wrap.h"
 
@@ -71,13 +72,20 @@ public:
         }
 
         gate_.init(rate);
+        split_ = cap_ != nullptr && capDev != playDev;  // two different sound cards = two clocks
+        if (split_) drift_.init(period);
         running_ = true;
+        if (split_) capTh_ = std::thread(&Engine::captureRun, this);
         th_ = std::thread(&Engine::run, this);
         return true;
     }
 
+    bool splitClocks() const { return split_; }
+
     void stop() {
-        if (running_.exchange(false) && th_.joinable()) th_.join();
+        running_ = false;
+        if (th_.joinable()) th_.join();
+        if (capTh_.joinable()) capTh_.join();
         if (cap_) { snd_pcm_close(cap_); cap_ = nullptr; }
         if (play_) { snd_pcm_close(play_); play_ = nullptr; }
     }
@@ -94,7 +102,9 @@ private:
     snd_pcm_t* cap_ = nullptr;
     snd_pcm_t* play_ = nullptr;
     int capCh_ = 2, playCh_ = 2;
-    std::thread th_;
+    std::thread th_, capTh_;
+    bool split_ = false;
+    DriftBuffer drift_;
     std::atomic<bool> running_{false};
     std::atomic<int> overBlocks_{0};
 
@@ -180,12 +190,33 @@ private:
         peakOut.store(std::max(peakOut.load() * 0.9f, pk), std::memory_order_relaxed);
     }
 
+    // Capture thread, only used when input and output are different sound cards.
+    void captureRun() {
+        setRealtime();
+        const int n = period;
+        std::vector<float> in((size_t)n * capCh_ + 8), mono((size_t)n);
+        snd_pcm_prepare(cap_);
+        snd_pcm_start(cap_);
+        while (running_) {
+            snd_pcm_sframes_t got = snd_pcm_readi(cap_, in.data(), n);
+            if (got < 0) {
+                if (snd_pcm_recover(cap_, (int)got, 1) < 0) std::this_thread::sleep_for(std::chrono::milliseconds(20));  // unplugged?
+                snd_pcm_start(cap_);
+                xruns++;
+                continue;
+            }
+            for (int i = 0; i < got; ++i) mono[(size_t)i] = in[(size_t)i * capCh_];
+            drift_.push(mono.data(), (int)got);
+        }
+    }
+
     void run() {
         setRealtime();
         const int n = period;
         std::vector<float> inI((size_t)n * capCh_ + 8), outI((size_t)n * playCh_), mono((size_t)n);
         const double periodSec = (double)n / (double)rate;
-        bool capLive = false;
+        bool capLive = split_;  // in split mode the capture thread owns the capture stream
+        bool wasLoop = false;
         const int overLimit = std::max(20, (int)(0.4 * rate / n));
 
         // prime playback so the first write does not underrun
@@ -197,17 +228,22 @@ private:
             if (loop.get() != loopSeen_) { loopSeen_ = loop.get(); loopPos_ = 0; }
 
             if (loop && !loop->empty()) {
-                if (capLive) { snd_pcm_drop(cap_); capLive = false; }
+                if (capLive && !split_) { snd_pcm_drop(cap_); capLive = false; }
+                wasLoop = true;
                 const std::vector<float>& L = *loop;
                 for (int i = 0; i < n; ++i) {
                     mono[(size_t)i] = L[loopPos_];
                     if (++loopPos_ >= L.size()) loopPos_ = 0;
                 }
+            } else if (split_) {
+                if (wasLoop) { drift_.flush(); wasLoop = false; }
+                drift_.pull(mono.data(), n);  // resampled to follow the playback clock
             } else if (cap_) {
+                wasLoop = false;
                 if (!capLive) { snd_pcm_prepare(cap_); snd_pcm_start(cap_); capLive = true; }
                 snd_pcm_sframes_t got = snd_pcm_readi(cap_, inI.data(), n);
                 if (got < 0) {
-                    snd_pcm_recover(cap_, (int)got, 1);
+                    if (snd_pcm_recover(cap_, (int)got, 1) < 0) std::this_thread::sleep_for(std::chrono::milliseconds(20));
                     snd_pcm_start(cap_);
                     xruns++;
                     got = 0;
@@ -234,7 +270,7 @@ private:
                 for (int c = 0; c < playCh_; ++c) outI[(size_t)i * playCh_ + c] = mono[(size_t)i];
             snd_pcm_sframes_t w = snd_pcm_writei(play_, outI.data(), n);
             if (w < 0) {
-                snd_pcm_recover(play_, (int)w, 1);
+                if (snd_pcm_recover(play_, (int)w, 1) < 0) std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 xruns++;
             }
         }

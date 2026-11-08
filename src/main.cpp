@@ -126,7 +126,7 @@ struct ModelLoad {
 };
 
 // ------------------------------------------------------------------ app state
-enum Row { R_MODEL, R_SIZE, R_IR, R_SRC, R_AUDIO, R_IN, R_GATE, R_BASS, R_MID, R_TREBLE, R_MASTER, R_COUNT };
+enum Row { R_MODEL, R_SIZE, R_IR, R_SRC, R_AIN, R_AOUT, R_IN, R_GATE, R_BASS, R_MID, R_TREBLE, R_MASTER, R_COUNT };
 enum Btn { B_NONE, B_UP, B_DOWN, B_LEFT, B_RIGHT, B_A, B_B, B_X, B_Y, B_L, B_R };
 
 struct ParamDef {
@@ -158,10 +158,10 @@ struct App {
     bool overShown = false;
     // audio device choices
     struct AudioChoice {
-        std::string label, cap, play;
+        std::string label, dev;  // dev = ALSA name; empty = none
     };
-    std::vector<AudioChoice> audioChoices;
-    int audioSel = 0, audioActive = 0;
+    std::vector<AudioChoice> inChoices, outChoices;
+    int inSel = 0, outSel = 0, inActive = 0, outActive = 0;
     int reqRate = 48000;
     bool audioOk = false;
     std::string modelName = "(none)", irName = "(none)", srcName = "Live input";
@@ -224,40 +224,54 @@ struct App {
     }
 
     // ---------------------------------------------------------- audio devices
+    static std::string shortLabel(const AudioCard& c) { return c.label + " (" + c.dev + ")"; }
+
     void buildAudioChoices() {
-        audioChoices.clear();
-        audioChoices.push_back({"System default", "default", "default"});
         const std::vector<AudioCard> cards = listAudioCards();
         {  // diagnostic file: what the system sees (readable on the PC)
             std::ofstream f(appDir + "/audio_devices.txt");
             f << "Audio cards found by namsp:\n";
-            for (auto& c : cards) f << "  " << c.dev << "  " << c.label << (c.capture ? " [in]" : "") << (c.playback ? " [out]" : "") << "\n";
+            for (auto& c : cards)
+                f << "  " << c.dev << "  " << c.label << (c.capture ? " [in]" : "") << (c.playback ? " [out]" : "") << "\n";
             std::ifstream pc("/proc/asound/cards");
             std::stringstream ss;
             ss << pc.rdbuf();
             f << "\n/proc/asound/cards:\n" << ss.str();
         }
-        for (auto& c : cards) {
-            if (c.capture && c.playback) audioChoices.push_back({c.label + " (in + out)", c.dev, c.dev});
-            else if (c.playback) audioChoices.push_back({c.label + " (out only)", "", c.dev});
-        }
-        audioSel = -1;
-        for (size_t i = 0; i < audioChoices.size(); ++i)
-            if (audioChoices[i].cap == eng.capDev && audioChoices[i].play == eng.playDev) audioSel = (int)i;
-        if (audioSel < 0) {
-            audioChoices.insert(audioChoices.begin(), {"Custom (namsp.cfg)", eng.capDev, eng.playDev});
-            audioSel = 0;
-        }
-        audioActive = audioSel;
+        outChoices.clear();
+        outChoices.push_back({"System output (muOS setting)", "default"});
+        for (auto& c : cards)
+            if (c.playback) outChoices.push_back({shortLabel(c), c.dev});
+        inChoices.clear();
+        inChoices.push_back({"System input", "default"});
+        for (auto& c : cards)
+            if (c.capture) inChoices.push_back({shortLabel(c), c.dev});
+        inChoices.push_back({"None (loop file only)", ""});
+
+        auto pick = [](std::vector<AudioChoice>& v, const std::string& cur, int& sel) {
+            sel = -1;
+            for (size_t i = 0; i < v.size(); ++i)
+                if (v[i].dev == cur) sel = (int)i;
+            if (sel < 0) {
+                v.insert(v.begin(), {"Custom: " + cur, cur});
+                sel = 0;
+            }
+        };
+        pick(outChoices, eng.playDev, outSel);
+        pick(inChoices, eng.capDev, inSel);
+        outActive = outSel;
+        inActive = inSel;
     }
 
     void updateAudioStatus(bool ok, const std::string& err) {
         if (ok) {
             char b[200];
-            snprintf(b, sizeof b, "Audio %d Hz / %d frames (%.1f ms)%s", eng.rate, eng.period,
-                     1000.0 * eng.period / eng.rate, eng.hasCapture() ? "" : " - no input");
+            snprintf(b, sizeof b, "Audio %d Hz / %d frames (%.1f ms)%s%s", eng.rate, eng.period,
+                     1000.0 * eng.period / eng.rate, eng.hasCapture() ? "" : " - no input",
+                     eng.splitClocks() ? "  [2 cards: drift comp.]" : "");
             audioStatus = b;
-            if (!eng.hasCapture() && !eng.captureNote.empty()) setStatus("Input: " + eng.captureNote, 7000);
+            if (!eng.hasCapture() && !eng.capDev.empty() && !eng.captureNote.empty())
+                setStatus("Input: " + eng.captureNote, 7000);
         } else {
             audioStatus = "AUDIO ERROR: " + err;
             setStatus(audioStatus, 15000);
@@ -265,16 +279,16 @@ struct App {
     }
 
     void applyAudio() {
-        if (audioSel == audioActive || audioChoices.empty()) return;
-        const AudioChoice c = audioChoices[(size_t)audioSel];
+        if ((inSel == inActive && outSel == outActive) || inChoices.empty() || outChoices.empty()) return;
         const int oldRate = eng.rate;
         eng.stop();
-        eng.capDev = c.cap;
-        eng.playDev = c.play;
+        eng.capDev = inChoices[(size_t)inSel].dev;
+        eng.playDev = outChoices[(size_t)outSel].dev;
         eng.rate = reqRate;
         std::string err;
         audioOk = eng.start(err);
-        audioActive = audioSel;
+        inActive = inSel;
+        outActive = outSel;
         updateAudioStatus(audioOk, err);
         if (audioOk && eng.rate != oldRate) {  // files were prepared for the old rate
             if (!irPath.empty()) loadIR(irPath);
@@ -422,10 +436,12 @@ struct App {
                 if (!modelPath.empty()) loadModel(modelPath);  // tier change = reload (in the background)
                 if (!modelPath.empty() && !modelSlimmable) setStatus("This model has a single size", 3000);
             }
-        } else if (sel == R_AUDIO) {
-            const int n = (int)audioChoices.size();
-            if (b == B_LEFT && n > 0) audioSel = (audioSel + n - 1) % n;
-            else if (b == B_RIGHT && n > 0) audioSel = (audioSel + 1) % n;
+        } else if (sel == R_AIN || sel == R_AOUT) {
+            auto& v = sel == R_AIN ? inChoices : outChoices;
+            int& cur = sel == R_AIN ? inSel : outSel;
+            const int n = (int)v.size();
+            if (b == B_LEFT && n > 0) cur = (cur + n - 1) % n;
+            else if (b == B_RIGHT && n > 0) cur = (cur + 1) % n;
             else if (b == B_A) applyAudio();
             else if (b == B_X) {
                 buildAudioChoices();
@@ -502,34 +518,37 @@ struct App {
             return;
         }
 
-        const int top = 44, rh = 29;
+        const int top = 44, rh = 26;
         for (int i = 0; i < R_COUNT; ++i) {
             int y = top + i * rh;
             if (i == sel) fill(ren, 8, y, W - 16, rh - 2, panel);
             SDL_Color lc = (i == sel) ? hi : wh;
             if (i == R_SIZE) {
-                txt.draw(18, y + 3, "Model size", lc);
-                txt.draw(190, y + 3, slimFull ? "Full (heavy, may not run in real time)" : "Lite (recommended)", i == sel ? wh : dim);
-            } else if (i == R_AUDIO) {
-                txt.draw(18, y + 3, "Audio device", lc);
-                std::string nm = audioChoices.empty() ? "(none)" : audioChoices[(size_t)audioSel].label;
-                if (audioSel != audioActive) nm += "   (press A)";
-                txt.draw(190, y + 3, clip(nm, 40), i == sel ? wh : dim);
+                txt.draw(18, y + 2, "Model size", lc);
+                txt.draw(190, y + 2, slimFull ? "Full (heavy, may not run in real time)" : "Lite (recommended)", i == sel ? wh : dim);
+            } else if (i == R_AIN || i == R_AOUT) {
+                const bool in = i == R_AIN;
+                const auto& v = in ? inChoices : outChoices;
+                const int cur = in ? inSel : outSel, act = in ? inActive : outActive;
+                txt.draw(18, y + 2, in ? "Audio input" : "Audio output", lc);
+                std::string nm = v.empty() ? "(none)" : v[(size_t)cur].label;
+                if (cur != act) nm += "  (press A)";
+                txt.draw(190, y + 2, clip(nm, 40), i == sel ? wh : dim);
             } else if (i < R_IN) {
                 const char* lab = i == R_MODEL ? "Amp (NAM)" : i == R_IR ? "Cab (IR)" : "Source";
                 std::string nm = i == R_MODEL ? (loadTask.busy ? std::string("Loading...")
                                                                : modelName + (eng.modelBypassed ? "  [BYPASSED: too heavy]" : ""))
                                  : i == R_IR  ? irName
                                               : srcLabel();
-                txt.draw(18, y + 3, lab, lc);
-                txt.draw(190, y + 3, clip(nm, 36), i == sel ? wh : dim);
+                txt.draw(18, y + 2, lab, lc);
+                txt.draw(190, y + 2, clip(nm, 36), i == sel ? wh : dim);
             } else {
                 const ParamDef& p = params[(size_t)ParamIndex(i)];
-                txt.draw(18, y + 3, p.label, lc);
-                txt.draw(190, y + 3, fmtParam(p), i == sel ? wh : dim);
+                txt.draw(18, y + 2, p.label, lc);
+                txt.draw(190, y + 2, fmtParam(p), i == sel ? wh : dim);
                 float t = (p.v->load() - p.mn) / (p.mx - p.mn);
-                fill(ren, 340, y + 10, 280, 8, {60, 60, 70, 255});
-                fill(ren, 340, y + 10, (int)(280 * std::max(0.0f, std::min(1.0f, t))), 8, i == sel ? hi : dim);
+                fill(ren, 340, y + 9, 280, 8, {60, 60, 70, 255});
+                fill(ren, 340, y + 9, (int)(280 * std::max(0.0f, std::min(1.0f, t))), 8, i == sel ? hi : dim);
             }
         }
 
