@@ -35,10 +35,17 @@ struct Config {
         path = p;
         std::ifstream f(p);
         std::string line;
+        auto trim = [](std::string t) {  // also strips the \r left by Windows editors
+            const char* ws = " \t\r\n";
+            size_t a = t.find_first_not_of(ws);
+            if (a == std::string::npos) return std::string();
+            return t.substr(a, t.find_last_not_of(ws) - a + 1);
+        };
         while (std::getline(f, line)) {
+            line = trim(line);
             auto eq = line.find('=');
-            if (eq == std::string::npos || line[0] == '#') continue;
-            kv[line.substr(0, eq)] = line.substr(eq + 1);
+            if (eq == std::string::npos || line.empty() || line[0] == '#') continue;
+            kv[trim(line.substr(0, eq))] = trim(line.substr(eq + 1));
         }
     }
     void save() const {
@@ -113,8 +120,13 @@ struct Task {
     }
 };
 
+struct ModelLoad {
+    std::shared_ptr<NamModel> m;
+    std::string err, path;
+};
+
 // ------------------------------------------------------------------ app state
-enum Row { R_MODEL, R_SIZE, R_IR, R_SRC, R_IN, R_GATE, R_BASS, R_MID, R_TREBLE, R_MASTER, R_COUNT };
+enum Row { R_MODEL, R_SIZE, R_IR, R_SRC, R_AUDIO, R_IN, R_GATE, R_BASS, R_MID, R_TREBLE, R_MASTER, R_COUNT };
 enum Btn { B_NONE, B_UP, B_DOWN, B_LEFT, B_RIGHT, B_A, B_B, B_X, B_Y, B_L, B_R };
 
 struct ParamDef {
@@ -142,6 +154,16 @@ struct App {
     std::string modelPath, irPath, loopPath;
     bool slimFull = false;  // A2 slimmable tier: false = lite (default on the H700), true = full
     bool modelSlimmable = false;
+    Task<ModelLoad> loadTask;
+    bool overShown = false;
+    // audio device choices
+    struct AudioChoice {
+        std::string label, cap, play;
+    };
+    std::vector<AudioChoice> audioChoices;
+    int audioSel = 0, audioActive = 0;
+    int reqRate = 48000;
+    bool audioOk = false;
     std::string modelName = "(none)", irName = "(none)", srcName = "Live input";
     std::string status, audioStatus;
     Uint32 statusUntil = 0;
@@ -162,7 +184,9 @@ struct App {
     // input
     Btn held = B_NONE;
     Uint32 nextRepeat = 0;
-    int btnA = 0, btnB = 1, btnX = 2, btnY = 3, btnL = 4, btnR = 5;
+    // Defaults for the RG35XX family ("Deeplay-keys" pad): A=3 B=4 Y=5 X=6 L=7 R=8
+    int btnA = 3, btnB = 4, btnX = 6, btnY = 5, btnL = 7, btnR = 8;
+    std::string lastInput;  // shown on screen to help find button numbers
     bool debugInput = false;
     std::vector<SDL_Joystick*> joys;
 
@@ -183,23 +207,85 @@ struct App {
             modelName = "(bypass)";
             return;
         }
-        setStatus("Loading model...", 60000);
-        render();
-        auto m = std::make_shared<NamModel>();
-        std::string err;
-        if (!m->load(path, eng.rate, Engine::kMaxBlock, slimFull ? 1.0 : 0.0, err)) {
-            setStatus("Model error: " + err, 6000);
+        if (loadTask.busy) {
+            setStatus("Still loading the previous model...", 3000);
             return;
         }
-        eng.setModel(m);
-        modelSlimmable = m->slimmable();
-        modelPath = path;
-        modelName = baseName(path);
-        double er = m->expectedRate();
-        if (er > 0 && (int)er != eng.rate)
-            setStatus("Warning: model expects " + std::to_string((int)er) + " Hz, running at " + std::to_string(eng.rate), 6000);
-        else
-            setStatus("Model loaded", 1500);
+        setStatus("Loading model...", 600000);
+        const double slim = slimFull ? 1.0 : 0.0;
+        const int rate = eng.rate;
+        loadTask.run([path, slim, rate]() {  // heavy: runs off the UI thread
+            ModelLoad r;
+            r.path = path;
+            auto m = std::make_shared<NamModel>();
+            if (m->load(path, rate, Engine::kMaxBlock, slim, r.err)) r.m = m;
+            return r;
+        });
+    }
+
+    // ---------------------------------------------------------- audio devices
+    void buildAudioChoices() {
+        audioChoices.clear();
+        audioChoices.push_back({"System default", "default", "default"});
+        const std::vector<AudioCard> cards = listAudioCards();
+        {  // diagnostic file: what the system sees (readable on the PC)
+            std::ofstream f(appDir + "/audio_devices.txt");
+            f << "Audio cards found by namsp:\n";
+            for (auto& c : cards) f << "  " << c.dev << "  " << c.label << (c.capture ? " [in]" : "") << (c.playback ? " [out]" : "") << "\n";
+            std::ifstream pc("/proc/asound/cards");
+            std::stringstream ss;
+            ss << pc.rdbuf();
+            f << "\n/proc/asound/cards:\n" << ss.str();
+        }
+        for (auto& c : cards) {
+            if (c.capture && c.playback) audioChoices.push_back({c.label + " (in + out)", c.dev, c.dev});
+            else if (c.playback) audioChoices.push_back({c.label + " (out only)", "", c.dev});
+        }
+        audioSel = -1;
+        for (size_t i = 0; i < audioChoices.size(); ++i)
+            if (audioChoices[i].cap == eng.capDev && audioChoices[i].play == eng.playDev) audioSel = (int)i;
+        if (audioSel < 0) {
+            audioChoices.insert(audioChoices.begin(), {"Custom (namsp.cfg)", eng.capDev, eng.playDev});
+            audioSel = 0;
+        }
+        audioActive = audioSel;
+    }
+
+    void updateAudioStatus(bool ok, const std::string& err) {
+        if (ok) {
+            char b[200];
+            snprintf(b, sizeof b, "Audio %d Hz / %d frames (%.1f ms)%s", eng.rate, eng.period,
+                     1000.0 * eng.period / eng.rate, eng.hasCapture() ? "" : " - no input");
+            audioStatus = b;
+            if (!eng.hasCapture() && !eng.captureNote.empty()) setStatus("Input: " + eng.captureNote, 7000);
+        } else {
+            audioStatus = "AUDIO ERROR: " + err;
+            setStatus(audioStatus, 15000);
+        }
+    }
+
+    void applyAudio() {
+        if (audioSel == audioActive || audioChoices.empty()) return;
+        const AudioChoice c = audioChoices[(size_t)audioSel];
+        const int oldRate = eng.rate;
+        eng.stop();
+        eng.capDev = c.cap;
+        eng.playDev = c.play;
+        eng.rate = reqRate;
+        std::string err;
+        audioOk = eng.start(err);
+        audioActive = audioSel;
+        updateAudioStatus(audioOk, err);
+        if (audioOk && eng.rate != oldRate) {  // files were prepared for the old rate
+            if (!irPath.empty()) loadIR(irPath);
+            if (!loopPath.empty()) loadLoop(loopPath);
+            if (!modelPath.empty()) loadModel(modelPath);
+        }
+    }
+
+    std::string srcLabel() const {
+        if (!loopPath.empty()) return srcName;
+        return eng.hasCapture() ? "Live input" : "Live input (no input device)";
     }
 
     void loadIR(const std::string& path) {
@@ -333,8 +419,17 @@ struct App {
         else if (sel == R_SIZE) {
             if (b == B_LEFT || b == B_RIGHT || b == B_A) {
                 slimFull = !slimFull;
-                if (!modelPath.empty()) loadModel(modelPath);  // tier change = reload on the UI thread
+                if (!modelPath.empty()) loadModel(modelPath);  // tier change = reload (in the background)
                 if (!modelPath.empty() && !modelSlimmable) setStatus("This model has a single size", 3000);
+            }
+        } else if (sel == R_AUDIO) {
+            const int n = (int)audioChoices.size();
+            if (b == B_LEFT && n > 0) audioSel = (audioSel + n - 1) % n;
+            else if (b == B_RIGHT && n > 0) audioSel = (audioSel + 1) % n;
+            else if (b == B_A) applyAudio();
+            else if (b == B_X) {
+                buildAudioChoices();
+                setStatus("Audio devices rescanned", 2000);
             }
         } else if (sel < R_IN) {
             if (b == B_A) openBrowser(sel);
@@ -407,26 +502,34 @@ struct App {
             return;
         }
 
-        const int top = 44, rh = 32;
+        const int top = 44, rh = 29;
         for (int i = 0; i < R_COUNT; ++i) {
             int y = top + i * rh;
             if (i == sel) fill(ren, 8, y, W - 16, rh - 2, panel);
             SDL_Color lc = (i == sel) ? hi : wh;
             if (i == R_SIZE) {
-                txt.draw(18, y + 4, "Model size", lc);
-                txt.draw(190, y + 4, slimFull ? "Full (heavier)" : "Lite (lighter)", i == sel ? wh : dim);
+                txt.draw(18, y + 3, "Model size", lc);
+                txt.draw(190, y + 3, slimFull ? "Full (heavy, may not run in real time)" : "Lite (recommended)", i == sel ? wh : dim);
+            } else if (i == R_AUDIO) {
+                txt.draw(18, y + 3, "Audio device", lc);
+                std::string nm = audioChoices.empty() ? "(none)" : audioChoices[(size_t)audioSel].label;
+                if (audioSel != audioActive) nm += "   (press A)";
+                txt.draw(190, y + 3, clip(nm, 40), i == sel ? wh : dim);
             } else if (i < R_IN) {
                 const char* lab = i == R_MODEL ? "Amp (NAM)" : i == R_IR ? "Cab (IR)" : "Source";
-                const std::string& nm = i == R_MODEL ? modelName : i == R_IR ? irName : srcName;
-                txt.draw(18, y + 4, lab, lc);
-                txt.draw(190, y + 4, clip(nm, 36), i == sel ? wh : dim);
+                std::string nm = i == R_MODEL ? (loadTask.busy ? std::string("Loading...")
+                                                               : modelName + (eng.modelBypassed ? "  [BYPASSED: too heavy]" : ""))
+                                 : i == R_IR  ? irName
+                                              : srcLabel();
+                txt.draw(18, y + 3, lab, lc);
+                txt.draw(190, y + 3, clip(nm, 36), i == sel ? wh : dim);
             } else {
                 const ParamDef& p = params[(size_t)ParamIndex(i)];
-                txt.draw(18, y + 4, p.label, lc);
-                txt.draw(190, y + 4, fmtParam(p), i == sel ? wh : dim);
+                txt.draw(18, y + 3, p.label, lc);
+                txt.draw(190, y + 3, fmtParam(p), i == sel ? wh : dim);
                 float t = (p.v->load() - p.mn) / (p.mx - p.mn);
-                fill(ren, 340, y + 11, 280, 8, {60, 60, 70, 255});
-                fill(ren, 340, y + 11, (int)(280 * std::max(0.0f, std::min(1.0f, t))), 8, i == sel ? hi : dim);
+                fill(ren, 340, y + 10, 280, 8, {60, 60, 70, 255});
+                fill(ren, 340, y + 10, (int)(280 * std::max(0.0f, std::min(1.0f, t))), 8, i == sel ? hi : dim);
             }
         }
 
@@ -452,6 +555,7 @@ struct App {
         bool showStatus = SDL_GetTicks() < statusUntil;
         txt.draw(12, H - 52, showStatus ? status : audioStatus, showStatus ? wh : dim);
         txt.draw(12, H - 26, "A:open  X:reset  L/R:x5  Y:quit", dim);
+        if (!lastInput.empty()) txt.draw(W - 12, H - 26, "last input: " + lastInput, dim, true);
         SDL_RenderPresent(ren);
     }
 
@@ -495,7 +599,7 @@ struct App {
     int kbR = 0, kbC = 0;
     static constexpr const char* kKeys[4] = {"abcdefghij", "klmnopqrst", "uvwxyz0123", "456789-_. "};
 
-    bool tasksBusy() const { return authTask.busy || listTask.busy || modelTask.busy || dlTask.busy; }
+    bool tasksBusy() const { return authTask.busy || listTask.busy || modelTask.busy || dlTask.busy || loadTask.busy; }
 
     void setAuth(const std::string& code, const std::string& url, const std::string& msg) {
         std::lock_guard<std::mutex> g(authMu);
@@ -665,6 +769,36 @@ struct App {
 
     // Called every frame: collects finished background jobs.
     void pump() {
+        if (loadTask.ready()) {
+            ModelLoad r = loadTask.take();
+            if (!r.m) {
+                setStatus("Model error: " + r.err, 6000);
+            } else {
+                eng.setModel(r.m);
+                modelSlimmable = r.m->slimmable();
+                modelPath = r.path;
+                modelName = baseName(r.path);
+                const double er = r.m->expectedRate();
+                if (er > 0 && (int)er != eng.rate)
+                    setStatus("Warning: model expects " + std::to_string((int)er) + " Hz, running at " + std::to_string(eng.rate), 6000);
+                else
+                    setStatus("Model loaded", 1500);
+            }
+        }
+        if (eng.modelBypassed.load()) {  // the audio thread gave up on a model that is too heavy
+            if (!overShown) {
+                overShown = true;
+                if (slimFull && modelSlimmable && !loadTask.busy && !modelPath.empty()) {
+                    slimFull = false;
+                    setStatus("Too heavy: switching to Lite", 6000);
+                    loadModel(modelPath);
+                } else {
+                    setStatus("Model too heavy for real time: bypassed", 8000);
+                }
+            }
+        } else {
+            overShown = false;
+        }
         if (authTask.ready()) {
             int r = authTask.take();
             if (r == 1 && online == O_SIGNIN) {
@@ -832,7 +966,20 @@ struct App {
                 txt.draw(24, 190, "and enter this code:", dim);
                 txt.draw(24, 220, code, hi, false, 2.6f);
             }
-            txt.draw(24, 330, clip(msg, 52), authTask.busy ? dim : red);
+            {
+                const SDL_Color mc = authTask.busy ? dim : red;
+                for (size_t k = 0, ln = 0; k < msg.size() && ln < 3; k += 50, ++ln)
+                    txt.draw(24, 320 + (int)ln * 28, msg.substr(k, 50), mc);
+                std::string low = msg;
+                std::transform(low.begin(), low.end(), low.begin(), ::tolower);
+                auto has = [&](const char* w) { return low.find(w) != std::string::npos; };
+                if (!authTask.busy) {
+                    if (has("ssl") || has("cert"))
+                        txt.draw(24, 410, "Fix: put cacert.pem next to the app (curl.se/ca)", hi);
+                    else if (has("resolve") || has("connect") || has("timed out") || has("timeout"))
+                        txt.draw(24, 410, "Fix: connect Wi-Fi in the muOS settings", hi);
+                }
+            }
             txt.draw(12, H - 28, authTask.busy ? "B: cancel" : "A: retry   B: back", dim);
             return;
         }
@@ -985,6 +1132,7 @@ struct App {
                 break;
             case SDL_JOYHATMOTION:
                 if (debugInput) printf("hat %d value %d\n", e.jhat.hat, e.jhat.value);
+                if (e.jhat.value) lastInput = "hat " + std::to_string((int)e.jhat.value);
                 if (e.jhat.value & SDL_HAT_UP) setHeld(B_UP);
                 else if (e.jhat.value & SDL_HAT_DOWN) setHeld(B_DOWN);
                 else if (e.jhat.value & SDL_HAT_LEFT) setHeld(B_LEFT);
@@ -1004,6 +1152,7 @@ struct App {
             }
             case SDL_JOYBUTTONDOWN:
                 if (debugInput) printf("button %d\n", e.jbutton.button);
+                lastInput = "button " + std::to_string((int)e.jbutton.button);
                 press(mapJoyButton(e.jbutton.button));
                 break;
             default: break;
@@ -1017,6 +1166,9 @@ struct App {
         cfg.kv["ir"] = irPath;
         cfg.kv["loop"] = loopPath;
         cfg.kv["slim_full"] = slimFull ? "1" : "0";
+        cfg.kv["capture"] = eng.capDev;
+        cfg.kv["playback"] = eng.playDev;
+        cfg.kv["running"] = "0";  // clean exit
         cfg.save();
     }
 };
@@ -1031,17 +1183,22 @@ int main(int argc, char** argv) {
 
     Config& cfg = app.cfg;
     cfg.load(app.appDir + "/namsp.cfg");
+    // If the previous run never reached a clean exit (freeze, power button), start in safe mode.
+    const bool unclean = cfg.str("running", "0") == "1";
+    cfg.kv["running"] = "1";
+    cfg.save();
     Engine& eng = app.eng;
     eng.capDev = cfg.str("capture", "default");
     eng.playDev = cfg.str("playback", "default");
     eng.rate = (int)cfg.num("rate", 48000);
+    app.reqRate = eng.rate;
     eng.period = (int)cfg.num("period", 128);
-    app.btnA = (int)cfg.num("btn_a", 0);
-    app.btnB = (int)cfg.num("btn_b", 1);
-    app.btnX = (int)cfg.num("btn_x", 2);
-    app.btnY = (int)cfg.num("btn_y", 3);
-    app.btnL = (int)cfg.num("btn_l", 4);
-    app.btnR = (int)cfg.num("btn_r", 5);
+    app.btnA = (int)cfg.num("btn_a", 3);
+    app.btnB = (int)cfg.num("btn_b", 4);
+    app.btnX = (int)cfg.num("btn_x", 6);
+    app.btnY = (int)cfg.num("btn_y", 5);
+    app.btnL = (int)cfg.num("btn_l", 7);
+    app.btnR = (int)cfg.num("btn_r", 8);
 
     app.params = {
         {"Input gain", "in", -12, 24, 0.5f, 0, &eng.p.inGainDb},
@@ -1052,7 +1209,7 @@ int main(int argc, char** argv) {
         {"Master", "master", -40, 6, 0.5f, -6, &eng.p.masterDb},
     };
     for (auto& p : app.params) p.v->store(cfg.num(p.key, p.def));
-    app.slimFull = cfg.num("slim_full", 0) > 0.5f;
+    app.slimFull = !unclean && cfg.num("slim_full", 0) > 0.5f;
 
     // TONE3000 online access
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -1092,27 +1249,19 @@ int main(int argc, char** argv) {
 
     // audio
     std::string err;
-    bool audioOk = eng.start(err);
-    if (audioOk) {
-        char b[160];
-        snprintf(b, sizeof b, "Audio %d Hz / %d frames (%.1f ms)%s", eng.rate, eng.period,
-                 1000.0 * eng.period / eng.rate, eng.hasCapture() ? "" : " - no input device");
-        app.audioStatus = b;
-        if (!eng.hasCapture()) app.srcName = "Live input (not available)";
-        if (!eng.hasCapture()) app.setStatus("Input: " + eng.captureNote, 7000);
-    } else {
-        app.audioStatus = "AUDIO ERROR: " + err;
-        app.setStatus(app.audioStatus, 15000);
-    }
+    app.audioOk = eng.start(err);
+    app.buildAudioChoices();
+    app.updateAudioStatus(app.audioOk, err);
 
-    // restore last session (only if audio started, models need the final sample rate)
-    if (audioOk) {
+    // restore last session (only if audio started, files need the final sample rate)
+    if (app.audioOk) {
         auto exists = [](const std::string& p) { std::error_code ec; return !p.empty() && fs::exists(p, ec); };
         std::string m = cfg.str("model", ""), ir = cfg.str("ir", ""), lp = cfg.str("loop", "");
         if (exists(ir)) app.loadIR(ir);
         if (exists(lp)) app.loadLoop(lp);
-        if (exists(m)) app.loadModel(m);
+        if (exists(m) && !unclean) app.loadModel(m);
     }
+    if (unclean) app.setStatus("Last session ended abnormally: safe mode (Lite, no model loaded)", 9000);
 
     while (!app.quit) {
         SDL_Event e;

@@ -30,6 +30,7 @@ public:
     Params p;
     std::atomic<float> peakIn{0}, peakOut{0}, cpuLoad{0};
     std::atomic<int> xruns{0};
+    std::atomic<bool> modelBypassed{false};  // set by the audio thread when the model is too heavy for real time
     std::string capDev = "default", playDev = "default";
     int rate = 48000;
     int period = 128;
@@ -43,6 +44,8 @@ public:
     // Opens the devices and starts the audio thread. Playback is mandatory,
     // capture is optional (loop-file mode still works without it).
     bool start(std::string& err) {
+        xruns = 0;
+        captureNote.clear();
         unsigned r = (unsigned)rate;
         snd_pcm_uframes_t per = (snd_pcm_uframes_t)std::min(std::max(period, 32), 1024);
         playCh_ = 2;
@@ -55,12 +58,16 @@ public:
         snd_pcm_uframes_t perc = per;
         capCh_ = 2;
         std::string cerr;
-        cap_ = openPcm(capDev.c_str(), SND_PCM_STREAM_CAPTURE, rc, perc, capCh_, cerr);
-        if (!cap_) captureNote = cerr;
-        else if ((int)rc != rate) {
-            captureNote = "capture rate differs from playback rate";
-            snd_pcm_close(cap_);
-            cap_ = nullptr;
+        if (capDev.empty()) {
+            captureNote = "no input device selected";
+        } else {
+            cap_ = openPcm(capDev.c_str(), SND_PCM_STREAM_CAPTURE, rc, perc, capCh_, cerr);
+            if (!cap_) captureNote = cerr;
+            else if ((int)rc != rate) {
+                captureNote = "capture rate differs from playback rate";
+                snd_pcm_close(cap_);
+                cap_ = nullptr;
+            }
         }
 
         gate_.init(rate);
@@ -75,7 +82,11 @@ public:
         if (play_) { snd_pcm_close(play_); play_ = nullptr; }
     }
 
-    void setModel(std::shared_ptr<NamModel> m) { std::atomic_store(&model_, std::move(m)); }
+    void setModel(std::shared_ptr<NamModel> m) {
+        std::atomic_store(&model_, std::move(m));
+        overBlocks_ = 0;
+        modelBypassed = false;
+    }
     void setIR(std::shared_ptr<std::vector<float>> ir) { std::atomic_store(&ir_, std::move(ir)); }
     void setLoop(std::shared_ptr<std::vector<float>> l) { std::atomic_store(&loop_, std::move(l)); }
 
@@ -85,6 +96,7 @@ private:
     int capCh_ = 2, playCh_ = 2;
     std::thread th_;
     std::atomic<bool> running_{false};
+    std::atomic<int> overBlocks_{0};
 
     std::shared_ptr<NamModel> model_;
     std::shared_ptr<std::vector<float>> ir_, loop_;
@@ -143,7 +155,7 @@ private:
         gate_.process(x, n, p.gateDb.load(std::memory_order_relaxed));
 
         auto model = std::atomic_load(&model_);
-        if (model) model->process(x, x, n);
+        if (model && !modelBypassed.load(std::memory_order_relaxed)) model->process(x, x, n);
 
         tone_.update(rate, p.bass.load(std::memory_order_relaxed), p.mid.load(std::memory_order_relaxed),
                      p.treble.load(std::memory_order_relaxed));
@@ -174,6 +186,7 @@ private:
         std::vector<float> inI((size_t)n * capCh_ + 8), outI((size_t)n * playCh_), mono((size_t)n);
         const double periodSec = (double)n / (double)rate;
         bool capLive = false;
+        const int overLimit = std::max(20, (int)(0.4 * rate / n));
 
         // prime playback so the first write does not underrun
         std::fill(outI.begin(), outI.end(), 0.0f);
@@ -209,6 +222,13 @@ private:
             auto t1 = std::chrono::steady_clock::now();
             float load = (float)(std::chrono::duration<double>(t1 - t0).count() / periodSec);
             cpuLoad.store(cpuLoad.load() * 0.9f + load * 0.1f, std::memory_order_relaxed);
+            // Protection: if the model needs more than the available time for ~0.4 s, bypass it
+            // so the console stays responsive (the UI then offers Lite or tells the user).
+            if (load > 1.0f) {
+                if (++overBlocks_ > overLimit) modelBypassed.store(true);
+            } else {
+                overBlocks_ = 0;
+            }
 
             for (int i = 0; i < n; ++i)
                 for (int c = 0; c < playCh_; ++c) outI[(size_t)i * playCh_ + c] = mono[(size_t)i];
@@ -220,3 +240,42 @@ private:
         }
     }
 };
+
+// ---------------------------------------------------------------- audio card list
+struct AudioCard {
+    std::string label;  // e.g. "NUX MG-30"
+    std::string dev;    // ALSA name, e.g. "plughw:1,0"
+    bool capture = false, playback = false;
+};
+
+inline std::vector<AudioCard> listAudioCards() {
+    std::vector<AudioCard> out;
+    int card = -1;
+    while (snd_card_next(&card) == 0 && card >= 0) {
+        char hw[32];
+        snprintf(hw, sizeof hw, "hw:%d", card);
+        snd_ctl_t* ctl = nullptr;
+        if (snd_ctl_open(&ctl, hw, 0) < 0) continue;
+        std::string label = "card " + std::to_string(card);
+        snd_ctl_card_info_t* ci;
+        snd_ctl_card_info_alloca(&ci);
+        if (snd_ctl_card_info(ctl, ci) == 0) label = snd_ctl_card_info_get_name(ci);
+        int dev = -1;
+        while (snd_ctl_pcm_next_device(ctl, &dev) == 0 && dev >= 0) {
+            snd_pcm_info_t* pi;
+            snd_pcm_info_alloca(&pi);
+            snd_pcm_info_set_device(pi, (unsigned)dev);
+            snd_pcm_info_set_subdevice(pi, 0);
+            snd_pcm_info_set_stream(pi, SND_PCM_STREAM_CAPTURE);
+            const bool cap = snd_ctl_pcm_info(ctl, pi) == 0;
+            snd_pcm_info_set_stream(pi, SND_PCM_STREAM_PLAYBACK);
+            const bool play = snd_ctl_pcm_info(ctl, pi) == 0;
+            if (cap || play) {
+                out.push_back({label, "plughw:" + std::to_string(card) + "," + std::to_string(dev), cap, play});
+                break;
+            }
+        }
+        snd_ctl_close(ctl);
+    }
+    return out;
+}
