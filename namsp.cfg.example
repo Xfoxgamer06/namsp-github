@@ -1,0 +1,20 @@
+# Copy to namsp.cfg next to the executable.
+# ---- audio: run `arecord -l` / `aplay -l` on the device. Card 1 -> plughw:1,0
+capture=plughw:1,0
+playback=plughw:1,0
+rate=48000
+period=128
+# ---- TONE3000 online access (needed for in-app search and download)
+# Create a free publishable key at tone3000.com > Settings > API Keys
+t3k_key=t3k_pub_xxxxxxxxxxxxxxxx
+# CA bundle for HTTPS. If a file named cacert.pem sits next to the executable it is used automatically.
+#cacert=/mnt/mmc/NAMAmp/cacert.pem
+# Last resort if HTTPS fails and the console clock cannot be fixed (disables certificate checks!)
+#tls_insecure=0
+# ---- joystick button indices (run ./namsp --debug-input over SSH)
+btn_a=0
+btn_b=1
+btn_x=2
+btn_y=3
+btn_l=4
+btn_r=5

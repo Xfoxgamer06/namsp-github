@@ -1,0 +1,6 @@
+This project is original code. It links against, and follows the public API usage of:
+
+- NeuralAmpModelerCore (MIT) - Copyright (c) Steven Atkinson - https://github.com/sdatkinson/NeuralAmpModelerCore
+- TONE3000 plugin (MIT) - Copyright (c) 2026 TONE3000 - API usage patterns taken from plugin/src/NamEngine.cpp (v0.0.12)
+
+Keep these notices if you redistribute binaries.
